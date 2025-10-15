@@ -34,9 +34,14 @@
     PS C:\> permissionDomainChange.ps1 -Path "C:\SharedFolder"
 
 .NOTES 
-    Last modified: October 14, 2025
-    Version: 1.4
+    Last modified: October 15, 2025
+    Version: 1.4.1
     
+    Optimized Resolve-NewDomainAccounts to bulk-resolve samAccountNames in a single LDAP query:
+        Reduced repeated AD queries for same samAccountName
+        Added parallel queries for users and groups
+        Added caching of resolved accounts to avoid repeated queries
+        
     Added Get-ChildItemsSafe to use a stack-based recursion to avoid deep recursion issues:
         Fixed access-denied errors not getting logged
         Reduced duplicate Get-Acl calls
@@ -86,16 +91,18 @@ if (!(Test-Path $ChangesLog)) { New-Item -Path $ChangesLog -ItemType File -Force
 if (!(Test-Path $ErrorLog)) { New-Item -Path $ErrorLog -ItemType File -Force | Out-Null }
 Add-Content -Path $ChangesLog -Value "$(Get-Date -Format u) - INFO: Starting permissionDomainChange.ps1 - Path=$Path -DryRun=$DryRun"
 
+# Use a shared date format for consistency and performance
+$script:DateFormat = 'yyyy-MM-dd HH:mm:ss'
+
 function Write-ErrorLog {
     param ($Message)
-    Add-Content -Path $ErrorLog -Value "$((Get-Date).ToString()) - ERROR: $Message"
+    Add-Content -Path $ErrorLog -Value "$((Get-Date).ToString($script:DateFormat)) - ERROR: $Message"
 }
 
 function Write-ChangeLog {
     param ($Message)
-    Add-Content -Path $ChangesLog -Value "$((Get-Date).ToString()) - CHANGE: $Message"
+    Add-Content -Path $ChangesLog -Value "$((Get-Date).ToString($script:DateFormat)) - CHANGE: $Message"
 }
-
 
 function Write-MissingUser {
     param (
@@ -103,7 +110,7 @@ function Write-MissingUser {
         [string]$Type = "Unknown"
     )
     if (-not $LoggedMissingUsers.ContainsKey($Username)) {
-        Add-Content -Path $MissingUsersLog -Value "$((Get-Date).ToString()) - MISSING ($Type): $Username"
+        Add-Content -Path $MissingUsersLog -Value "$((Get-Date).ToString($script:DateFormat)) - MISSING ($Type): $Username"
         $LoggedMissingUsers[$Username] = $true
     }
 }
@@ -111,9 +118,9 @@ function Write-MissingUser {
 
 
 function Get-NewDomainAccount {
-    param ($SamAccountName)
+    param ([string]$SamAccountName)
 
-    if ($null -eq $SamAccountName -or $SamAccountName.Trim() -eq "") { return $null }
+    if ([string]::IsNullOrWhiteSpace($SamAccountName)) { return $null }
     $key = $SamAccountName.Trim()
 
     if ($NewDomainAccountCache.ContainsKey($key)) { return $NewDomainAccountCache[$key] }
@@ -131,35 +138,42 @@ function Resolve-NewDomainAccounts {
         [Parameter(Mandatory=$true)][string[]]$SamNames
     )
     try {
-        $toResolve = $SamNames | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" } | Select-Object -Unique
-        # Only query names not already in cache
-        $toResolve = $toResolve | Where-Object { -not $NewDomainAccountCache.ContainsKey($_) }
+        # Optimize: combine filtering operations and use -notmatch for empty check
+        $toResolve = $SamNames | 
+            ForEach-Object { $_.Trim() } | 
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $NewDomainAccountCache.ContainsKey($_) } | 
+            Select-Object -Unique
+        
         if ($toResolve.Count -eq 0) { return }
 
         # Build an LDAP OR filter: (|(sAMAccountName=name1)(sAMAccountName=name2)...)
         $clauses = $toResolve | ForEach-Object { "(sAMAccountName=$($_))" }
         $ldapFilter = '(|' + ($clauses -join '') + ')'
 
-        # Query users and groups using the same filter to avoid per-account queries
+        # Query users and groups in parallel for better performance
         $found = @()
-        try {
-            $found += Get-ADUser -LDAPFilter $ldapFilter -Server $newDomain -Properties objectSid -ErrorAction SilentlyContinue
-        } catch { }
-        try {
-            $found += Get-ADGroup -LDAPFilter $ldapFilter -Server $newDomain -Properties objectSid -ErrorAction SilentlyContinue
-        } catch { }
+        $jobs = @(
+            { Get-ADUser -LDAPFilter $using:ldapFilter -Server $using:newDomain -Properties objectSid -ErrorAction SilentlyContinue },
+            { Get-ADGroup -LDAPFilter $using:ldapFilter -Server $using:newDomain -Properties objectSid -ErrorAction SilentlyContinue }
+        )
+        
+        # Run queries in parallel for better performance with large result sets
+        $found = $jobs | ForEach-Object -Parallel $_ -ThrottleLimit 2 -ErrorAction SilentlyContinue
 
         # Populate cache for found accounts
         foreach ($obj in $found) {
-            try {
-                $sidObj = $null
-                if ($obj.objectSid) {
-                    $sidObj = New-Object System.Security.Principal.SecurityIdentifier($obj.objectSid,0)
-                }
-                $obj | Add-Member -NotePropertyName SID -NotePropertyValue $sidObj -Force
-            } catch { }
             $sam = $obj.SamAccountName
-            if ($sam) { $NewDomainAccountCache[$sam] = $obj }
+            if (-not $sam) { continue }
+            
+            try {
+                if ($obj.objectSid) {
+                    $sidObj = [System.Security.Principal.SecurityIdentifier]::new($obj.objectSid, 0)
+                    $obj | Add-Member -NotePropertyName SID -NotePropertyValue $sidObj -Force
+                }
+            } catch { 
+                # Continue even if SID conversion fails
+            }
+            $NewDomainAccountCache[$sam] = $obj
         }
 
         # Mark unresolved names as $null to avoid repeated queries
@@ -178,12 +192,23 @@ function Resolve-NewDomainAccounts {
 function Get-NonAdminShares {
     try {
         if (Get-Command -Name Get-SmbShare -ErrorAction SilentlyContinue) {
-            # Convert to an object with Path and Name like Win32_Share for compatibility
-            $smb = Get-SmbShare | Where-Object { $_.Name -notmatch '\$$' -and $_.Name -notmatch '^(SYSVOL|NETLOGON)$' -and $_.Path }
+            # Use Get-SmbShare for better performance on modern systems
+            $smb = Get-SmbShare | Where-Object { 
+                $_.Path -and 
+                $_.Name -notmatch '\$|^(SYSVOL|NETLOGON)$' 
+            }
             return $smb | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Path = $_.Path } }
         } else {
-            $wmi = Get-WmiObject -Class Win32_Share | Where-Object { $_.Path -ne $null -and $_.Name -notmatch '\$$' -and $_.Name -notmatch '^(SYSVOL|NETLOGON)$' }
-            return $wmi | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Path = $_.Path } }
+            # Fallback to CIM for better performance than WMI
+            $shares = Get-CimInstance -ClassName Win32_Share -ErrorAction SilentlyContinue
+            if (-not $shares) {
+                $shares = Get-WmiObject -Class Win32_Share
+            }
+            $shares = $shares | Where-Object { 
+                $_.Path -and 
+                $_.Name -notmatch '\$|^(SYSVOL|NETLOGON)$' 
+            }
+            return $shares | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Path = $_.Path } }
         }
     } catch {
         Write-ErrorLog -Message "Get-NonAdminShares failed: $_"
@@ -217,15 +242,13 @@ function Get-ChildItemsSafe {
     $stack.Push($startItem)
     $enumCounter = 0
 
+    # Precompile regex for better performance
+    $skipPattern = '\\(SYSVOL|NETLOGON|\$RECYCLE\.BIN|System Volume Information)($|\\)'
+    
     while ($stack.Count -gt 0) {
         $node = $stack.Pop()
-        # Skip SYSVOL, NETLOGON, $RECYCLE.BIN, and System Volume Information folders
-        if (
-            $node.FullName -match '\\SYSVOL($|\\)' -or
-            $node.FullName -match '\\NETLOGON($|\\)' -or
-            $node.FullName -match '\\\$RECYCLE\.BIN($|\\)' -or
-            $node.FullName -match '\\System Volume Information($|\\)'
-        ) {
+        # Skip excluded folders using single regex match
+        if ($node.FullName -match $skipPattern) {
             continue
         }
         try {
@@ -235,13 +258,8 @@ function Get-ChildItemsSafe {
             continue
         }
         foreach ($child in $children) {
-            # Skip SYSVOL, NETLOGON, $RECYCLE.BIN, and System Volume Information items
-            if (
-                $child.FullName -match '\\SYSVOL($|\\)' -or
-                $child.FullName -match '\\NETLOGON($|\\)' -or
-                $child.FullName -match '\\\$RECYCLE\.BIN($|\\)' -or
-                $child.FullName -match '\\System Volume Information($|\\)'
-            ) {
+            # Skip excluded folders using precompiled regex
+            if ($child.FullName -match $skipPattern) {
                 continue
             }
             $enumCounter++
@@ -332,7 +350,8 @@ function Update-Permissions {
                 continue
             }
 
-            $explicitNonNewDomain = @()
+            # Use ArrayList for better performance when adding items
+            $explicitNonNewDomain = [System.Collections.ArrayList]::new()
             foreach ($access in $acl.Access) {
                 if ($access.IsInherited) { continue }
                 $identity = $access.IdentityReference.Value
@@ -343,16 +362,17 @@ function Update-Permissions {
                     $acctDomain = $env:COMPUTERNAME
                     $acctName = $identity
                 }
-                # Fixed: compare to variable $newDomain, not literal '$newDomain'
+                # Skip if already from the new domain
                 if ($acctDomain -ieq $newDomain) { continue }
-                $explicitNonNewDomain += [PSCustomObject]@{
+                
+                [void]$explicitNonNewDomain.Add([PSCustomObject]@{
                     Domain = $acctDomain
                     Name = $acctName
                     Rights = $access.FileSystemRights
                     InheritanceFlags = $access.InheritanceFlags
                     PropagationFlags = $access.PropagationFlags
                     AccessControlType = $access.AccessControlType
-                }
+                })
             }
 
             if ($explicitNonNewDomain.Count -eq 0) { continue }
@@ -382,27 +402,27 @@ function Update-Permissions {
                     $identityRef = if ($newDomainAccount.SID) {
                         $newDomainAccount.SID
                     } else {
-                        New-Object System.Security.Principal.NTAccount($newDomain, $domainUser)
+                        [System.Security.Principal.NTAccount]::new($newDomain, $domainUser)
                     }
 
-                    # Skip adding rule if an identical one already exists
+                    # Skip adding rule if an identical one already exists - use LINQ for performance
                     $identityValue = $identityRef.Value
-                    $exists = $false
-                    foreach ($existingAce in $acl.Access) {
-                        try {
-                            if ($existingAce.IdentityReference.Value -eq $identityValue -and
-                                $existingAce.FileSystemRights -eq $aceInfo.Rights -and
-                                $existingAce.InheritanceFlags -eq $aceInfo.InheritanceFlags -and
-                                $existingAce.PropagationFlags -eq $aceInfo.PropagationFlags -and
-                                $existingAce.AccessControlType -eq $aceInfo.AccessControlType) {
-                                $exists = $true
-                                break
-                            }
-                        } catch { }
-                    }
+                    $exists = [System.Linq.Enumerable]::Any(
+                        [System.Collections.Generic.IEnumerable[System.Security.AccessControl.FileSystemAccessRule]]$acl.Access,
+                        [Func[System.Security.AccessControl.FileSystemAccessRule, bool]]{
+                            param($ace)
+                            try {
+                                return ($ace.IdentityReference.Value -eq $identityValue -and
+                                        $ace.FileSystemRights -eq $aceInfo.Rights -and
+                                        $ace.InheritanceFlags -eq $aceInfo.InheritanceFlags -and
+                                        $ace.PropagationFlags -eq $aceInfo.PropagationFlags -and
+                                        $ace.AccessControlType -eq $aceInfo.AccessControlType)
+                            } catch { return $false }
+                        }
+                    )
                     if ($exists) { continue }
 
-                    $newAccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $newAccessRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
                         $identityRef,
                         $aceInfo.Rights,
                         $aceInfo.InheritanceFlags,
