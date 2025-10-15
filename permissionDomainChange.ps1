@@ -41,7 +41,7 @@
         Reduced repeated AD queries for same samAccountName
         Added parallel queries for users and groups
         Added caching of resolved accounts to avoid repeated queries
-        
+    Optimized for faster execution, reduced memory overhead, and better performance on Active Directory.
     Added Get-ChildItemsSafe to use a stack-based recursion to avoid deep recursion issues:
         Fixed access-denied errors not getting logged
         Reduced duplicate Get-Acl calls
