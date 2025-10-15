@@ -150,15 +150,15 @@ function Resolve-NewDomainAccounts {
         $clauses = $toResolve | ForEach-Object { "(sAMAccountName=$($_))" }
         $ldapFilter = '(|' + ($clauses -join '') + ')'
 
-        # Query users and groups in parallel for better performance
+        # Query users and groups with a PS7-optimized path (Parallel) and 5.1 fallback
         $found = @()
-        $jobs = @(
-            { Get-ADUser -LDAPFilter $using:ldapFilter -Server $using:newDomain -Properties objectSid -ErrorAction SilentlyContinue },
-            { Get-ADGroup -LDAPFilter $using:ldapFilter -Server $using:newDomain -Properties objectSid -ErrorAction SilentlyContinue }
-        )
-        
-        # Run queries in parallel for better performance with large result sets
-        $found = $jobs | ForEach-Object -Parallel $_ -ThrottleLimit 2 -ErrorAction SilentlyContinue
+        # Remove -Server parameter (use default domain context)
+        try {
+            $found += Get-ADUser -LDAPFilter $ldapFilter -Properties objectSid -ErrorAction SilentlyContinue
+        } catch {}
+        try {
+            $found += Get-ADGroup -LDAPFilter $ldapFilter -Properties objectSid -ErrorAction SilentlyContinue
+        } catch {}
 
         # Populate cache for found accounts
         foreach ($obj in $found) {
@@ -201,8 +201,11 @@ function Get-NonAdminShares {
         } else {
             # Fallback to CIM for better performance than WMI
             $shares = Get-CimInstance -ClassName Win32_Share -ErrorAction SilentlyContinue
-            if (-not $shares) {
-                $shares = Get-WmiObject -Class Win32_Share
+            if ($null -eq $shares) {
+                $shares = Get-WmiObject -Class Win32_Share -ErrorAction SilentlyContinue
+            }
+            if ($null -eq $shares) {
+                $shares = @()
             }
             $shares = $shares | Where-Object { 
                 $_.Path -and 
@@ -405,21 +408,21 @@ function Update-Permissions {
                         [System.Security.Principal.NTAccount]::new($newDomain, $domainUser)
                     }
 
-                    # Skip adding rule if an identical one already exists - use LINQ for performance
+                    # Skip adding rule if an identical one already exists
                     $identityValue = $identityRef.Value
-                    $exists = [System.Linq.Enumerable]::Any(
-                        [System.Collections.Generic.IEnumerable[System.Security.AccessControl.FileSystemAccessRule]]$acl.Access,
-                        [Func[System.Security.AccessControl.FileSystemAccessRule, bool]]{
-                            param($ace)
-                            try {
-                                return ($ace.IdentityReference.Value -eq $identityValue -and
-                                        $ace.FileSystemRights -eq $aceInfo.Rights -and
-                                        $ace.InheritanceFlags -eq $aceInfo.InheritanceFlags -and
-                                        $ace.PropagationFlags -eq $aceInfo.PropagationFlags -and
-                                        $ace.AccessControlType -eq $aceInfo.AccessControlType)
-                            } catch { return $false }
-                        }
-                    )
+                    $exists = $false
+                    foreach ($ace in $acl.Access) {
+                        try {
+                            if ($ace.IdentityReference.Value -eq $identityValue -and
+                                $ace.FileSystemRights -eq $aceInfo.Rights -and
+                                $ace.InheritanceFlags -eq $aceInfo.InheritanceFlags -and
+                                $ace.PropagationFlags -eq $aceInfo.PropagationFlags -and
+                                $ace.AccessControlType -eq $aceInfo.AccessControlType) {
+                                $exists = $true
+                                break
+                            }
+                        } catch {}
+                    }
                     if ($exists) { continue }
 
                     $newAccessRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
