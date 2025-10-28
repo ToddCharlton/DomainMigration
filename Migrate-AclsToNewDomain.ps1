@@ -6,15 +6,15 @@
 .DESCRIPTION
     This script will look at permissions in the file path given using the
      -Path argument. It will then go through all domain user accounts for
-     the local domain, find the matching account on the Inovar domain,
-     and add identical permissions for the Inovar "version" of this account.
+     the local domain, find the matching account on the new domain,
+     and add identical permissions for the new domain "version" of this account.
      The script will also change share permissions and NTFS permissions 
      for those shares if you answer "y" at the first prompt.
      Logs are saved in C:\Logs. There may be up to 2 logs: file/folder
-     changes as well as a list of users NOT found in the Inovar domain.
+     changes as well as a list of users NOT found in the new domain.
 
 .AUTHOR
-    Todd Charlton (tcharlton@inovarpkg.com)
+    Todd Charlton (todd.charlton@gmail.com)
 
 .PARAMETER Parameter1
      -DryRun
@@ -31,43 +31,10 @@
 .EXAMPLE
     Example usage of the script/function.
     PS C:\> permissionDomainChange.ps1 -Path "C:\SharedFolder"
-<#
-.SYNOPSIS
-    This script is for switching a computer's local NTFS and share
-    permissions to Inovar domain permissions.
-
-.DESCRIPTION
-    This script will look at permissions in the file path given using the
-     -Path argument. It will then go through all domain user accounts for
-     the local domain, find the matching account on the Inovar domain,
-     and add identical permissions for the Inovar "version" of this account.
-     The script will also change share permissions and NTFS permissions 
-     for those shares if you answer "y" at the first prompt.
-     Logs are saved in C:\Logs. There may be up to 2 logs: file/folder
-     changes as well as a list of users NOT found in the Inovar domain.
-
-.AUTHOR
-    Todd Charlton (tcharlton@inovarpkg.com)
-
-.PARAMETER Parameter1
-     -DryRun
-     If specified, the script will log what changes would be made, but not actually apply them. 
-     Similar to -WhatIf in other cmdlets.
-
-     -Path <System.String[]>
-     Specifies the path of the location of the new item. The default is the current location when Path is omitted. You can specify the name of the new item in Name , or include it 
-     in Path . Items names passed using the Name parameter are created relative to the value of the Path parameter.
-        
-     For this cmdlet, the Path parameter works like the LiteralPath parameter of other cmdlets. Wildcard characters are not interpreted. All characters are passed to the location's 
-     provider. The provider may not support all characters. For example, you can't create a filename that contains an asterisk (`*`) character.
-
-.EXAMPLE
-    Example usage of the script/function.
-    PS C:\> migrateACLsToNewDomain.ps1 -Path "C:\SharedFolder" -WhatIf
 
 .NOTES 
-    Last modified: October 20, 2025
-    Version: 2.0
+    Last modified: October 28, 2025
+    Version: 2.1
     
     Changed entire script to work with PowerShell 7.
     Added -WhatIf switch parameter
