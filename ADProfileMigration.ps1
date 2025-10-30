@@ -14,15 +14,15 @@
     Todd Charlton (todd.charlton@gmail.com)
 
 .NOTES 
-    Last modified: October 28, 2025
-    Version: 1.0   
+    Last modified: October 30, 2025
+    Version: 1.2
+    
 #>
 
 # Config - Change these values as needed for your environment
 $newDomain = "inovar.local"
 $USMTPath = "\\modws08.modtek.int\USMT"
 $StorePath = Join-Path $env:SystemDrive "USMT\Store"
-#$currentDomain = (Get-WmiObject Win32_ComputerSystem).Domain
 $USMTDomain = "modtek.int"
 $EnableDebug = $false
 
@@ -104,18 +104,103 @@ while ($true) {
 $selectedAccounts = $selected | ForEach-Object { $profiles[$_].Account }
 Write-Host "Selected: $($selectedAccounts -join ', ')" -ForegroundColor Cyan
 
-# Prompt for credentials to access USMT share.
-Write-Host "Enter credentials to access USMT share ($USMTDomain domain):" -ForegroundColor Cyan
-$usmtCreds = Get-Credential -Message "Enter Admin credentials for $USMTDomain"
+# Get current domain before prompting for credentials
+$currentDomain = (Get-WmiObject Win32_ComputerSystem).Domain
+
+# Function to test domain credentials using PrincipalContext
+function Test-DomainCredentials {
+    param(
+        [System.Management.Automation.PSCredential]$Credential,
+        [string]$Domain
+    )
+    try {
+        Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+        
+        $username = $Credential.UserName
+        # Strip domain prefix if present (support both DOMAIN\user and user@domain.com formats)
+        if ($username -like "*\*") {
+            $username = $username.Split('\')[-1]
+        } elseif ($username -like "*@*") {
+            $username = $username.Split('@')[0]
+        }
+        
+        $password = $Credential.GetNetworkCredential().Password
+        
+        Write-Host "Validating credentials for $username against domain $Domain..." -ForegroundColor Yellow
+        
+        # Create PrincipalContext for the specified domain
+        $principalContext = New-Object System.DirectoryServices.AccountManagement.PrincipalContext('Domain', $Domain)
+        
+        if ($principalContext.ValidateCredentials($username, $password)) {
+            Write-Host "AD Authentication successful for $username on $Domain" -ForegroundColor Green
+            $principalContext.Dispose()
+            return $true
+        } else {
+            Write-Host "AD Authentication failed for $username on $Domain" -ForegroundColor Red
+            $principalContext.Dispose()
+            return $false
+        }
+    } catch {
+        Write-Host "Error during credential validation: $($_.Exception.Message)" -ForegroundColor Red
+        if ($principalContext) { $principalContext.Dispose() }
+        return $false
+    }
+}
+
+# Function to get and validate credentials with retry
+function Get-ValidatedCredentials {
+    param(
+        [string]$Message,
+        [string]$Domain,
+        [int]$MaxRetries = 3
+    )
+    for ($i = 1; $i -le $MaxRetries; $i++) {
+        $cred = Get-Credential -Message $Message
+        if (-not $cred) {
+            Write-Host "Credential prompt cancelled. Exiting." -ForegroundColor Red
+            exit 1
+        }
+        
+        Write-Host "Validating credentials..." -ForegroundColor Yellow
+        if (Test-DomainCredentials -Credential $cred -Domain $Domain) {
+            Write-Host "Credentials validated successfully." -ForegroundColor Green
+            return $cred
+        } else {
+            if ($i -lt $MaxRetries) {
+                Write-Host "Invalid credentials. Please try again. (Attempt $i of $MaxRetries)" -ForegroundColor Red
+            } else {
+                Write-Host "Invalid credentials after $MaxRetries attempts. Exiting." -ForegroundColor Red
+                exit 1
+            }
+        }
+    }
+}
+
+# Check if USMT share is on the same domain as this computer
+$skipUSMTCreds = $false
+if ($currentDomain -eq $USMTDomain) {
+  Write-Host "Computer is already on the USMT domain ($USMTDomain). Will use current domain credentials for USMT share access." -ForegroundColor Green
+  $skipUSMTCreds = $true
+}
+
+# Prompt for credentials to access USMT share (only if on different domain)
+if (-not $skipUSMTCreds) {
+  Write-Host "Enter credentials to access USMT share ($USMTDomain domain):" -ForegroundColor Cyan
+  $usmtCreds = Get-ValidatedCredentials -Message "Enter Admin credentials for $USMTDomain" -Domain $USMTDomain
+}
 
 # Prompt for credentials for the CURRENT domain (to unjoin)
-$currentDomain = (Get-WmiObject Win32_ComputerSystem).Domain
 Write-Host "Enter credentials with rights to REMOVE this computer from the CURRENT domain ($currentDomain):" -ForegroundColor Cyan
-$currentDomainCreds = Get-Credential -Message "Enter an account from $currentDomain with rights to remove computers from the domain"
+$currentDomainCreds = Get-ValidatedCredentials -Message "Enter an account from $currentDomain with rights to remove computers from the domain" -Domain $currentDomain
+
+# If we skipped USMT creds, use the current domain creds for USMT access
+if ($skipUSMTCreds) {
+  $usmtCreds = $currentDomainCreds
+}
 
 # Prompt for credentials for the NEW domain (to join)
 Write-Host "Enter credentials with rights to JOIN this computer to the NEW domain ($newDomain):" -ForegroundColor Cyan
-$newDomainCreds = Get-Credential -Message "Enter an account from $newDomain with rights to join computers to the domain"
+$newDomainCreds = Get-ValidatedCredentials -Message "Enter an account from $newDomain with rights to join computers to the domain" -Domain $newDomain
 
 # Map USMT share with net use (Windows-level drive letter)
 $driveLetter = "U:"
@@ -258,7 +343,10 @@ foreach ($acct in $selectedAccounts) {
         $folder = $matches | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         $selectedProfileInfos += [pscustomobject]@{ Account = $acct; Path = $folder.FullName }
     } else {
-        "DEBUG: No .old folder found for $acct ($user)" | Out-File -FilePath $debugLog -Append -Encoding UTF8
+        # Only write debug info if debug is enabled and debugLog is defined
+        if ($EnableDebug -and $debugLog) {
+            "DEBUG: No .old folder found for $acct ($user)" | Out-File -FilePath $debugLog -Append -Encoding UTF8
+        }
     }
 }
 
@@ -444,14 +532,23 @@ finally {
 }
 "@
 
-# --- Copy the generated post-reboot script to C:\TEMP for inspection ---
-if ($EnableDebug) {
-  try {
-    Copy-Item -Path $PostRebootScript -Destination "C:\TEMP\USMT_PostReboot.ps1" -Force
-    Write-Host "Copied USMT_PostReboot.ps1 to C:\TEMP for inspection." -ForegroundColor Yellow
-  } catch {
-    Write-Host "Failed to copy USMT_PostReboot.ps1 to C:\TEMP: $($_.Exception.Message)" -ForegroundColor Red
-  }
+# --- Ensure the post-reboot script is always created regardless of debug mode, and add verification ---
+Set-Content -Path $PostRebootScript -Value $PostRebootContent -Force -Encoding UTF8
+
+# --- Verify the post-reboot script was created successfully ---
+if (Test-Path $PostRebootScript) {
+  Write-Host "Post-reboot script created successfully at $PostRebootScript" -ForegroundColor Green
+} else {
+  Write-Host "ERROR: Failed to create post-reboot script at $PostRebootScript" -ForegroundColor Red
+  exit 1
+}
+
+# --- Copy the generated post-reboot script to C:\TEMP for inspection (always, not just debug) ---
+try {
+  Copy-Item -Path $PostRebootScript -Destination "C:\TEMP\USMT_PostReboot.ps1" -Force
+  Write-Host "Copied USMT_PostReboot.ps1 to C:\TEMP for inspection." -ForegroundColor Yellow
+} catch {
+  Write-Host "Failed to copy USMT_PostReboot.ps1 to C:\TEMP: $($_.Exception.Message)" -ForegroundColor Red
 }
 
 # Create scheduled task to run LoadState after reboot
@@ -505,12 +602,45 @@ try {
   Write-Host "Could not check/remove existing computer account: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
+# Split the domain operations: unjoin first, then join with retry logic
 try {
-  Add-Computer -DomainName $newDomain -Credential $newDomainCreds -UnjoinDomainCredential $currentDomainCreds -Force -Options AccountCreate,JoinWithNewName
-  Write-Host "Domain join initiated. Rebooting to complete domain join and restore profiles..." -ForegroundColor Cyan
+  # Step 1: Unjoin from current domain
+  Write-Host "Unjoining from current domain ($currentDomain)..." -ForegroundColor Yellow
+  Remove-Computer -UnjoinDomainCredential $currentDomainCreds -Force -ErrorAction Stop
+  Write-Host "Successfully unjoined from $currentDomain" -ForegroundColor Green
+  
+  # Step 2: Wait a moment for the unjoin to complete
+  Start-Sleep -Seconds 5
+  
+  # Step 3: Join new domain with retry logic
+  $joinSuccess = $false
+  $maxRetries = 3
+  for ($i = 1; $i -le $maxRetries; $i++) {
+    try {
+      Write-Host "Attempting to join $newDomain (attempt $i of $maxRetries)..." -ForegroundColor Cyan
+      Add-Computer -DomainName $newDomain -Credential $newDomainCreds -Force -Options AccountCreate -ErrorAction Stop
+      Write-Host "Successfully joined $newDomain" -ForegroundColor Green
+      $joinSuccess = $true
+      break
+    } catch {
+      Write-Host "Join attempt $i failed: $($_.Exception.Message)" -ForegroundColor Yellow
+      if ($i -lt $maxRetries) {
+        Write-Host "Waiting 10 seconds before retry..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 10
+      }
+    }
+  }
+  
+  if (-not $joinSuccess) {
+    throw "Failed to join $newDomain after $maxRetries attempts. Manual intervention may be required."
+  }
+  
+  Write-Host "Domain join completed successfully. Rebooting to complete domain join and restore profiles..." -ForegroundColor Cyan
   Restart-Computer -Force
+  
 } catch {
-  Write-Host "Domain join failed: $($_.Exception.Message)" -ForegroundColor Red
-  Write-Host "TIP: If the computer account already exists in the new domain, delete it manually from Active Directory and try again." -ForegroundColor Yellow
+  Write-Host "Domain operation failed: $($_.Exception.Message)" -ForegroundColor Red
+  Write-Host "TIP: You may need to manually join the domain or delete the computer account in AD if it exists." -ForegroundColor Yellow
+  Write-Host "The scheduled task for profile restoration will still run on next reboot if you manually join the domain." -ForegroundColor Yellow
   exit 1
 }
