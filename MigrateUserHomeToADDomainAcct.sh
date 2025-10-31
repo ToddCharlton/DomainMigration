@@ -56,7 +56,6 @@ FullScriptName=`basename "$0"`
 ShowVersion="$FullScriptName $Version"
 check4AD=`/usr/bin/dscl localhost -list . | grep "Active Directory"`
 osvers=$(sw_vers -productVersion | awk -F. '{print $2}')
-lookupAccount=da-tcharlton
 # Save current IFS state
 
 OLDIFS=$IFS
@@ -103,7 +102,7 @@ until [ "$user" == "FINISHED" ]; do
 			# Verify NetID
 				printf "\e[1m$netIDprompt"
 				read netname
-				/usr/bin/id $lookupAccount
+				/usr/bin/id $netname
 				echo "Did the information displayed include a line similar to this: gid=1360859114 (DOMAIN\domain users)? It should be the second item listed."
 				select yn in "Yes" "No"; do
     					case $yn in
